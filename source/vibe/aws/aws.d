@@ -22,6 +22,7 @@ import vibe.http.common;
 import std.digest.sha;
 import vibe.aws.sigv4;
 import std.math;
+import std.exception:enforce;
 
 import memutils.all;
 import kxml.xml;
@@ -180,10 +181,8 @@ abstract class RESTClient {
         auto creds = m_credsSource.credentials(credScope);
 
         auto queryString = buildQueryParameterString(queryParameters);
-		writefln("method: %s",method);
-		if (queryString.length>0)
-			queryString = "?" ~ queryString;
-		writefln("url: %s","https://" ~ endpoint ~ resource ~ queryString);
+	if (queryString.length>0)
+		queryString = "?" ~ queryString;
         auto retries = ExponentialBackoff(m_config.maxErrorRetry);
 
 
@@ -211,7 +210,7 @@ abstract class RESTClient {
                 if (creds.sessionToken && !creds.sessionToken.empty)
                     req.headers["x-amz-security-token"] = creds.sessionToken;
 	
-				auto canonicalRequest = CanonicalRequest(
+		auto canonicalRequest = CanonicalRequest(
                     method.to!string,
                     resource,
                     null,
@@ -223,17 +222,17 @@ abstract class RESTClient {
                     null
                 );
 
-				auto date = isoTimeString.dateFromISOString;
-				auto time = isoTimeString.timeFromISOString;
+		auto date = isoTimeString.dateFromISOString;
+		auto time = isoTimeString.timeFromISOString;
 	            //Calculate the seed signature
-	            auto signableRequest = SignableRequest(date, time, region, service, canonicalRequest);
-	            auto key = signingKey(creds.accessKeySecret, date, region, service);
-	            auto binarySignature = key.sign(cast(ubyte[])signableRequest.signableStringForStream);
+		auto signableRequest = SignableRequest(date, time, region, service, canonicalRequest);
+	        auto key = signingKey(creds.accessKeySecret, date, region, service);
+	        auto binarySignature = key.sign(cast(ubyte[])signableRequest.signableStringForStream);
 				
-	            auto credScope = date ~ "/" ~ region ~ "/" ~ service;
-	            signRequest(req, queryParameters, jsonString, creds, isoTimeString, region, service);
-	            req.writeBody(jsonString);
-	        });
+	        auto credScope = date ~ "/" ~ region ~ "/" ~ service;
+	        signRequest(req, queryParameters, jsonString, creds, isoTimeString, region, service);
+	        req.writeBody(jsonString);
+	     });
             checkForError(resp);
             return resp;
         }
@@ -343,7 +342,6 @@ abstract class RESTClient {
             auto signableRequest = SignableRequest(date, time, region, service, canonicalRequest);
             auto key = signingKey(creds.accessKeySecret, date, region, service);
             auto binarySignature = key.sign(cast(ubyte[])signableRequest.signableStringForStream);
-			writefln("key = %s, id = %s",creds.accessKeyID,creds.accessKeySecret);
             auto credScope = date ~ "/" ~ region ~ "/" ~ service;
             signRequest(req, null, null, creds, isoTimeString, region, service);
             auto authHeader = createSignatureHeader(creds.accessKeyID, credScope, canonicalRequest.headers, binarySignature);
@@ -390,19 +388,23 @@ abstract class RESTClient {
 
     void checkForError(HTTPClientResponse response)
     {
-		import vibe.stream.operations;
+	import vibe.stream.operations;
+	string code;
+	XmlNode document;
+	string message;
         if (response.statusCode < 400) 
             return; // No error
-		writefln("%s",response.headers);
-		writefln("%s",response.statusCode);
-		writefln("%s",response.statusPhrase);
-		writefln("body: %s",cast(char[])readAll(response.bodyReader));
-		/+
-        auto document = readXML(response);
-        auto code = document.parseXPath("/Error/Code")[0].getCData;
-        auto message = document.parseXPath("/Error/Message")[0].getCData; +/
-        //throw makeException(code, response.statusCode / 100 == 5, message);
-        throw new Exception("oops");
+        try
+	{
+		document = readXML(response);
+        	code = document.parseXPath("/Error/Code")[0].getCData;
+       		message = document.parseXPath("/Error/Message")[0].getCData;
+	}
+	catch(Exception e)
+	{
+		throw new Exception("error parsing "~response.toString);
+	}
+        throw makeException(code, response.statusCode / 100 == 5, message);
     }
 
     AWSException makeException(string type, bool retriable, string message,
