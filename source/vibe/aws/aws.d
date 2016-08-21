@@ -169,8 +169,9 @@ abstract class RESTClient {
         return stringBuilder.data;
     }
 
-    HTTPClientResponse doRequest(HTTPMethod method, string resource, string[string] queryParameters, in InetHeaderMap headers)
+    HTTPClientResponse doRequest(HTTPMethod method, string resource, string[string] queryParameters, in InetHeaderMap headers, Json request = Json.emptyObject)
     {
+		enum blockSize = 512*1024;
         if (!resource.startsWith("/"))
             resource = "/" ~ resource;
 
@@ -179,8 +180,13 @@ abstract class RESTClient {
         auto creds = m_credsSource.credentials(credScope);
 
         auto queryString = buildQueryParameterString(queryParameters);
-
+		writefln("method: %s",method);
+		if (queryString.length>0)
+			queryString = "?" ~ queryString;
+		writefln("url: %s","https://" ~ endpoint ~ resource ~ queryString);
         auto retries = ExponentialBackoff(m_config.maxErrorRetry);
+
+
         foreach(triesLeft; retries)
         {
             HTTPClientResponse resp;
@@ -191,20 +197,43 @@ abstract class RESTClient {
                     resp.destroy();
                 }
 
-            resp = requestHTTP("https://" ~ endpoint ~ resource ~ "?" ~ queryString, (scope HTTPClientRequest req) {
+            resp = requestHTTP("https://" ~ endpoint ~ resource ~ queryString, (scope HTTPClientRequest req) {
                 req.method = method;
                 
                 foreach(key, value; headers)
                     req.headers[key] = value;
 
                 req.headers["host"] = endpoint;
-                auto timeString = currentTimeString();
-                req.headers["x-amz-date"] = timeString;
+                auto isoTimeString = currentTimeString();
+                req.headers["x-amz-date"] = isoTimeString;
+                auto jsonString = cast(ubyte[])request.toString();
                 req.headers["x-amz-content-sha256"] = sha256Of("").toHexString().toLower();
                 if (creds.sessionToken && !creds.sessionToken.empty)
                     req.headers["x-amz-security-token"] = creds.sessionToken;
-                signRequest(req, queryParameters, null, creds, timeString, region, service);
-            });
+	
+				auto canonicalRequest = CanonicalRequest(
+                    method.to!string,
+                    resource,
+                    null,
+                    [
+                        "host":                         req.headers["host"],
+                        "x-amz-content-sha256":         req.headers["x-amz-content-sha256"],
+                        "x-amz-date":                   req.headers["x-amz-date"],
+                    ],
+                    null
+                );
+
+				auto date = isoTimeString.dateFromISOString;
+				auto time = isoTimeString.timeFromISOString;
+	            //Calculate the seed signature
+	            auto signableRequest = SignableRequest(date, time, region, service, canonicalRequest);
+	            auto key = signingKey(creds.accessKeySecret, date, region, service);
+	            auto binarySignature = key.sign(cast(ubyte[])signableRequest.signableStringForStream);
+				
+	            auto credScope = date ~ "/" ~ region ~ "/" ~ service;
+	            signRequest(req, queryParameters, jsonString, creds, isoTimeString, region, service);
+	            req.writeBody(jsonString);
+	        });
             checkForError(resp);
             return resp;
         }
@@ -229,6 +258,7 @@ abstract class RESTClient {
                                 in InetHeaderMap headers, in string[] additionalSignedHeaders,
                                 scope InputStream payload, ulong payloadSize, ulong blockSize = 512*1024)
     {
+		import vibe.core.stream;
         //Calculate the body size upfront for the "Content-Length" header
         auto base16 = (ulong x) { return ceil(log2(x)/4).to!ulong; };
         enum ulong signatureSize = ";chunk-signature=".length + 64;
@@ -277,7 +307,9 @@ abstract class RESTClient {
                 req.contentType = headers["Content-Type"];
             else
                 req.contentType = "application/octet-stream";
-            
+
+
+            req.headers["host"] = endpoint;
             req.headers["Content-Length"] = bodySize.to!string;
             req.headers["Content-Encoding"] = newEncoding;
             req.headers["x-amz-content-sha256"] = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
@@ -311,26 +343,27 @@ abstract class RESTClient {
             auto signableRequest = SignableRequest(date, time, region, service, canonicalRequest);
             auto key = signingKey(creds.accessKeySecret, date, region, service);
             auto binarySignature = key.sign(cast(ubyte[])signableRequest.signableStringForStream);
-
+			writefln("key = %s, id = %s",creds.accessKeyID,creds.accessKeySecret);
             auto credScope = date ~ "/" ~ region ~ "/" ~ service;
+            signRequest(req, null, null, creds, isoTimeString, region, service);
             auto authHeader = createSignatureHeader(creds.accessKeyID, credScope, canonicalRequest.headers, binarySignature);
-            req.headers["authorization"] = authHeader;
+            req.headers["authorization"] = authHeader; 
 
             //Write the data in chunks to the stream
             auto outputStream = new ChunkedOutputStream(req.bodyWriter);
+            enforce(outputStream !is null);
             outputStream.maxBufferSize = blockSize;
 //            auto outputStream = cast(ChunkedOutputStream) req.bodyWriter;
-//            enforce(outputStream !is null);
 
             auto signature = binarySignature.toHexString().toLower();
             outputStream.chunkExtensionCallback = (in ubyte[] data)
             {
                 auto chunk = SignableChunk(date, time, region, service, signature, hash(data));
                 signature = key.sign(cast(ubyte[])chunk.signableString).toHexString().toLower();
-                return "chunk-signature=" ~ signature;
+                return "chunk-signature=" ~ signature; 
             };
             outputStream.write(payload);
-            outputStream.finalize;
+            outputStream.finalize; 
         });
         checkForError(resp);
         return resp;
@@ -357,13 +390,19 @@ abstract class RESTClient {
 
     void checkForError(HTTPClientResponse response)
     {
+		import vibe.stream.operations;
         if (response.statusCode < 400) 
             return; // No error
-
+		writefln("%s",response.headers);
+		writefln("%s",response.statusCode);
+		writefln("%s",response.statusPhrase);
+		writefln("body: %s",cast(char[])readAll(response.bodyReader));
+		/+
         auto document = readXML(response);
         auto code = document.parseXPath("/Error/Code")[0].getCData;
-        auto message = document.parseXPath("/Error/Message")[0].getCData;
-        throw makeException(code, response.statusCode / 100 == 5, message);
+        auto message = document.parseXPath("/Error/Message")[0].getCData; +/
+        //throw makeException(code, response.statusCode / 100 == 5, message);
+        throw new Exception("oops");
     }
 
     AWSException makeException(string type, bool retriable, string message,
